@@ -32,8 +32,17 @@ using namespace std;
 using namespace Eigen;
 
 namespace msckf_vio{
+
+  /**************************************************
+   * @brief 定义状态变量
+   * x_imu=[q b_g v b_a p q_e p_e]:21维
+   * x_ca=[q p]:6*N维
+   * ***************************************************/
+
 // Static member variables in IMUState class.
 StateIDType IMUState::next_id = 0;
+//下面四个状态用来计算Q矩阵
+//噪声方差
 double IMUState::gyro_noise = 0.001;
 double IMUState::acc_noise = 0.01;
 double IMUState::gyro_bias_noise = 0.001;
@@ -123,6 +132,7 @@ bool MsckfVio::loadParameters() {
   nh.param<double>("initial_covariance/acc_bias",
       acc_bias_cov, 1e-2);
 
+  //这个外参是哪个外参？
   double extrinsic_rotation_cov, extrinsic_translation_cov;
   nh.param<double>("initial_covariance/extrinsic_rotation_cov",
       extrinsic_rotation_cov, 3.0462e-4);
@@ -149,6 +159,7 @@ bool MsckfVio::loadParameters() {
   Isometry3d T_cam0_imu = T_imu_cam0.inverse();
 
   // 相机与Imu之间的外参要估计，将其初值设为配置文件相关的值
+  //把CV类型的数据转换成eigen的数据
   state_server.imu_state.R_imu_cam0 = T_cam0_imu.linear().transpose();
   state_server.imu_state.t_cam0_imu = T_cam0_imu.translation();
   CAMState::T_cam0_cam1 =
@@ -213,6 +224,7 @@ bool MsckfVio::createRosIO() {
   feature_sub = nh.subscribe("features", 40,
       &MsckfVio::featureCallback, this);
 
+  //这个topic是干什么用的？
   mocap_odom_sub = nh.subscribe("mocap_odom", 10,
       &MsckfVio::mocapOdomCallback, this);
   mocap_odom_pub = nh.advertise<nav_msgs::Odometry>("gt_odom", 1);
@@ -233,7 +245,11 @@ bool MsckfVio::initialize() {
   ROS_INFO("Finish loading ROS parameters...");
 
   // Initialize state server
-  // 连续时间下的噪声矩阵Q
+  // 连续时间下的噪声矩阵Q ：12维，分别是
+// [gyro_noise             ]
+// [   gyro_bias_noise     ]
+// [      acc_noise        ]
+// [         acc_bias_noise]
   state_server.continuous_noise_cov =
     Matrix<double, 12, 12>::Zero();
   state_server.continuous_noise_cov.block<3, 3>(0, 0) =
@@ -298,8 +314,8 @@ void MsckfVio::imuCallback(
 
 /**
   * @brief 在系统开始运行后，在一定数量的Imu数据基础上初始化IMU的偏置和初始方向
-  *    
-  * 得到重力向量以及Imu的初始方向
+  *    获得角速度的bias，得到加速度的bias，确定重力方向，得到IMU和世界坐标系的变换
+  * 
   */
 void MsckfVio::initializeGravityAndBias() {
 
@@ -358,6 +374,7 @@ bool MsckfVio::resetCallback(
   imu_sub.shutdown();
 
   // Reset the IMU state.
+  //这个定义的IMU状态不是滤波器中IMU的状态
   IMUState& imu_state = state_server.imu_state;
   imu_state.time = 0.0;
   imu_state.orientation = Vector4d(0.0, 0.0, 0.0, 1.0);
@@ -596,10 +613,14 @@ void MsckfVio::batchImuProcessing(const double& time_bound) {
   // 
   for (const auto& imu_msg : imu_msg_buffer) {
     double imu_time = imu_msg.header.stamp.toSec();
+    
+    //对IMU和图像进行时间对齐
+    //state_server.imu_state.time:第一帧图像的时间戳
     if (imu_time < state_server.imu_state.time) {
       ++used_imu_msg_cntr;
       continue;
     }
+    //time_bound也是第一帧图像的时间戳
     if (imu_time > time_bound) break;
 
     // Convert the msgs.
@@ -610,10 +631,14 @@ void MsckfVio::batchImuProcessing(const double& time_bound) {
     // Execute process model.
     // 对每个imu数据执行
     processModel(imu_time, m_gyro, m_acc);
+
+    //怎么这个变量又加了一遍？
+    // 因为要对使用的imu进行计数
     ++used_imu_msg_cntr;
   }
 
   // Set the state ID for the new IMU state.
+  //应该是标记新一组状态的的ID
   state_server.imu_state.id = IMUState::next_id++;
 
   // Remove all used IMU msgs.
@@ -626,23 +651,23 @@ void MsckfVio::batchImuProcessing(const double& time_bound) {
 /**
  * @brief imu状态误差传递方程得到新的状态，循环处理每个imu数据
  *
- * 得到gyro为^ω，而acc为^a
+ * 用测量数据减去bias，得到gyro为^ω，而acc为^a（真值）
  * 根据论文得到矩阵F和G，并根据连续时间下的动态方程得到状态转移矩阵
  * 四阶龙哥库塔积分得到预测的新状态
  * 离散化状态转移方程得到噪声协方差矩阵Qk，并imu状态协方差传递公式得到预测的协方差Pk
  * 更新相机与imu相关性协方差得到msckf的全协方差
  * 
  */
-void MsckfVio::processModel(const double& time,
-    const Vector3d& m_gyro,
-    const Vector3d& m_acc) {
+void MsckfVio::processModel(const double& time,const Vector3d& m_gyro,const Vector3d& m_acc) {
 
   // Remove the bias from the measured gyro and acceleration
   // 对Imu量测去掉偏置
   // 见论文III-A 公式(1)，式中的gyro为论文中的^ω，而acc为^a
+  //得到状态误差
   IMUState& imu_state = state_server.imu_state;
   Vector3d gyro = m_gyro - imu_state.gyro_bias;
   Vector3d acc = m_acc - imu_state.acc_bias;
+  //time是一帧IMU数据的时间戳，imu_state.time是与IMU最近的图像的时间戳
   double dtime = time - imu_state.time;
 
   // Compute discrete transition and noise covariance matrix
@@ -652,6 +677,8 @@ void MsckfVio::processModel(const double& time,
 
   // F矩阵的计算详见论文附录A
   // imu_state.orientation为（I_G）^q，即
+  //F.block<p,q>(i,j):提取块大小为(p,q),起始于(i,j)
+  //《MSCKF》equation(10)
   F.block<3, 3>(0, 0) = -skewSymmetric(gyro);
   F.block<3, 3>(0, 3) = -Matrix3d::Identity();
   F.block<3, 3>(6, 0) = -quaternionToRotation(
@@ -672,7 +699,7 @@ void MsckfVio::processModel(const double& time,
   // F和G是连续时间下的误差方程，需要离散化
   // x‘= F * x + G * n离散化得到方程
   // x(k+1) = Φx(k) + W(k)
-  // 离散化状态转移矩阵F得到的矩阵为Φ，计算详见组合导航44页
+  // 离散化状态转移矩阵F得到的矩阵为Φ，计算详见组合导航44页，利用解微分方程的方法，将IMU误差状态量解为exp（Fdt）
   // Φ等于e^(F*△t)
   // 将其泰勒展开，保留三阶项：Φ = I + F * △t + 0.5 * F^2 * △t^2+....
   Matrix<double, 21, 21> Fdt = F * dtime;
@@ -683,6 +710,7 @@ void MsckfVio::processModel(const double& time,
 
   // Propogate the state using 4th order Runge-Kutta
   // 采用4阶龙哥库塔数值积分来传递imu状态误差，得到预测的新状态值
+  //这个不是预积分，它是来一帧更新一下全局状态
   predictNewState(dtime, gyro, acc);
 
   // Modify the transition matrix
@@ -732,13 +760,17 @@ void MsckfVio::processModel(const double& time,
         0, 21, 21, state_server.state_cov.cols()-21) =
       Phi * state_server.state_cov.block(
         0, 21, 21, state_server.state_cov.cols()-21);
+
+
     state_server.state_cov.block(
         21, 0, state_server.state_cov.rows()-21, 21) =
       state_server.state_cov.block(
         21, 0, state_server.state_cov.rows()-21, 21) * Phi.transpose();
   }
 
+  //这个是什么意思？
   // 为了保证数值的稳定性，进行半正定处理：P(ij) = P(ji)
+
   MatrixXd state_cov_fixed = (state_server.state_cov +
       state_server.state_cov.transpose()) / 2.0;
   state_server.state_cov = state_cov_fixed;
@@ -754,7 +786,7 @@ void MsckfVio::processModel(const double& time,
 }
 
 /**
- * @brief 将imu的当前状态通过四阶龙哥库塔积分来估计新的imu状态
+ * @brief IMU状态积分，然后采用四阶RK离散化
  *
  * 计算Omega
  * 计算四阶龙哥库塔积分的四个系数k1,k2,k3和k4
@@ -784,12 +816,15 @@ void MsckfVio::predictNewState(const double& dt,
   // 四元数乘法详见《quaternion kinematics for error-state KF》第5页
   // dq_dt为更新一次后的四元数，dq_dt2为1/2 △t时刻的四元数
   Vector4d dq_dt, dq_dt2;
+
   if (gyro_norm > 1e-5) {
     dq_dt = (cos(gyro_norm*dt*0.5)*Matrix4d::Identity() +
       1/gyro_norm*sin(gyro_norm*dt*0.5)*Omega) * q;
     dq_dt2 = (cos(gyro_norm*dt*0.25)*Matrix4d::Identity() +
       1/gyro_norm*sin(gyro_norm*dt*0.25)*Omega) * q;
   }
+
+  //当w的模特别小时，sin(w)是趋近于零的，容易造成数值不稳定，所以使用cos(w*dt*0.5)代替，然后当w趋近于0时，cos趋近于1
   else {
     dq_dt = (Matrix4d::Identity()+0.5*dt*Omega) *
       cos(gyro_norm*dt*0.5) * q;
@@ -802,6 +837,7 @@ void MsckfVio::predictNewState(const double& dt,
   // 龙哥库塔四个系数，tn表示当前时刻
   // 速度： k1 = f(tn, yn) = R（tn）*a + g
   // 位置： k1 = f(tn, pn) = v
+  //对应的是论文IIIA 的前几个公式
   Vector3d k1_v_dot = quaternionToRotation(q).transpose()*acc +
     IMUState::gravity;
   Vector3d k1_p_dot = v;
@@ -825,6 +861,7 @@ void MsckfVio::predictNewState(const double& dt,
   Vector3d k4_p_dot = k3_v;
 
   // yn+1 = yn + dt/6*(k1+2*k2+2*k3+k4)
+  // 完成状态积分
   q = dq_dt;
   quaternionNormalize(q);
   v = v + dt/6*(k1_v_dot+2*k2_v_dot+2*k3_v_dot+k4_v_dot);
@@ -834,7 +871,8 @@ void MsckfVio::predictNewState(const double& dt,
 }
 
 /**
- * @brief 做了两部分工作：根据已知的imu与相机外参以及Imu运动模型 \n
+ * @brief 在
+ * 做了两部分工作：根据已知的imu与相机外参以及Imu运动模型 \n
  * 推测出当前相机的位姿并加入msckf状态向量中； 对系统的协方差矩阵进行增广 
  *
  */
@@ -847,14 +885,18 @@ void MsckfVio::stateAugmentation(const double& time) {
   // 根据imu与相机的外参以及imu自身的运动模型可以大致推断出当前相机的位姿
   // R_w_i表示，惯性系到imu系的转换； R_i_c表示imu到相机转换； R_w_c表示惯性系到相机转换
   // t_c_w表示惯性系下的相机位置； t_c_i表示imu系下的相机位置（外参的t）
+  //根据《MSCKF》的equation（14）
   Matrix3d R_w_i = quaternionToRotation(
       state_server.imu_state.orientation);
   Matrix3d R_w_c = R_i_c * R_w_i;
+  //应该是把那个平移向量t_c_i当成位置了
   Vector3d t_c_w = state_server.imu_state.position +
     R_w_i.transpose()*t_c_i;
 
+  //状态向量增广
   // 为该新生成的相机状态创建新的结构体 
   // state_server.cam_states的类型pair<const StateIDType, CAMState> > >
+
   state_server.cam_states[state_server.imu_state.id] =
     CAMState(state_server.imu_state.id);
   CAMState& cam_state = state_server.cam_states[
@@ -872,11 +914,13 @@ void MsckfVio::stateAugmentation(const double& time) {
   // To simplify computation, the matrix J below is the nontrivial block
   // in Equation (16) in "A Multi-State Constraint Kalman Filter for Vision
   // -aided Inertial Navigation".
-  // 步骤2： 增广相机状态后， 需要计算增广的相机状态对msckf已有的状态的雅克比
+  // 步骤2： 增广相机状态后， 需要计算增广的相机状态对msckf已有的状态的雅克比，并重新计算协方差矩阵
   // 雅克比的计算详见论文《s-msckf》文章的附录B
   Matrix<double, 6, 21> J = Matrix<double, 6, 21>::Zero();
+  //相机姿态角对IMU的偏导
   J.block<3, 3>(0, 0) = R_i_c;
   J.block<3, 3>(0, 15) = Matrix3d::Identity();
+  //相机位置对IMU的偏导数就是外参的平移转到IMU坐标系下的反对称矩阵
   J.block<3, 3>(3, 0) = skewSymmetric(R_w_i.transpose()*t_c_i);
   //J.block<3, 3>(3, 0) = -R_w_i.transpose()*skewSymmetric(t_c_i);
   J.block<3, 3>(3, 12) = Matrix3d::Identity();
@@ -886,7 +930,7 @@ void MsckfVio::stateAugmentation(const double& time) {
   // msckf未增广状态矩阵前的协方差矩阵维数
   size_t old_rows = state_server.state_cov.rows();
   size_t old_cols = state_server.state_cov.cols();
-  // 
+  //状态协方差维数+6
   state_server.state_cov.conservativeResize(old_rows+6, old_cols+6);
 
   // Rename some matrix blocks for convenience.
@@ -908,6 +952,7 @@ void MsckfVio::stateAugmentation(const double& time) {
     J * P11 * J.transpose();
 
   // Fix the covariance to be symmetric
+  //这个是保证协方差矩阵正定
   MatrixXd state_cov_fixed = (state_server.state_cov +
       state_server.state_cov.transpose()) / 2.0;
   state_server.state_cov = state_cov_fixed;
@@ -929,11 +974,14 @@ void MsckfVio::addFeatureObservations(
   // Add new observations for existing features or new
   // features in the map server.
   for (const auto& feature : msg->features) {
+    //map_server是一个map类型，用的STL的函数 find
     // find，返回的是被查找元素的位置，没有则返回map.end()
     if (map_server.find(feature.id) == map_server.end()) {
       // This is a new feature.
       // 新的特征点则加入到map中
       map_server[feature.id] = Feature(feature.id);
+
+      //这个数据结构？
       map_server[feature.id].observations[state_id] =
         Vector4d(feature.u0, feature.v0,
             feature.u1, feature.v1);
@@ -976,19 +1024,24 @@ void MsckfVio::measurementJacobian(
 
   // 两个相机的位姿（左边相机通过imu计算得到）
   // Cam0 pose.
+  //平移向量可以直接通过position的信息得到
   Matrix3d R_w_c0 = quaternionToRotation(cam_state.orientation);
   const Vector3d& t_c0_w = cam_state.position;
 
   // 右边的相机位姿可通过两个相机的外参计算得到
   // Cam1 pose.
+  //.linear():[R t]的R
+  //          [0 1]
+  //.translation():是t
   Matrix3d R_c0_c1 = CAMState::T_cam0_cam1.linear();
   Matrix3d R_w_c1 = CAMState::T_cam0_cam1.linear() * R_w_c0;
+  //这个公式怎么来的？对于变换一直很迷糊…… ~_~!
   Vector3d t_c1_w = t_c0_w - R_w_c1.transpose()*CAMState::T_cam0_cam1.translation();
 
   // 3d feature position in the world frame.
   // And its observation with the stereo cameras.
   // p为地图点在世界坐标系下的位置
-  // z为真值
+  // z为两个相机像素坐标系下的值
   const Vector3d& p_w = feature.position;
   const Vector4d& z = feature.observations.find(cam_state_id)->second;
 
@@ -1001,6 +1054,9 @@ void MsckfVio::measurementJacobian(
   // Compute the Jacobians.
   // Hc = z'/cp' * cp'/x'  Hf  = z'/ cp' * cp'/gp'
   // z'/cp'
+  //观测对相机状态的雅克比
+
+  //链式求导法则：z到三维点的偏导乘以三维点对状态的偏导
   Matrix<double, 4, 3> dz_dpc0 = Matrix<double, 4, 3>::Zero();
   dz_dpc0(0, 0) = 1 / p_c0(2);
   dz_dpc0(1, 1) = 1 / p_c0(2);
@@ -1022,6 +1078,7 @@ void MsckfVio::measurementJacobian(
   dpc1_dxc.leftCols(3) = R_c0_c1 * skewSymmetric(p_c0);
   dpc1_dxc.rightCols(3) = -R_w_c1;
 
+  //观测对特征点的雅克比
   Matrix3d dpc0_dpg = R_w_c0;
   Matrix3d dpc1_dpg = R_w_c1;
 
@@ -1045,7 +1102,7 @@ void MsckfVio::measurementJacobian(
   H_f = -H_x.block<4, 3>(0, 3);
 
   // Compute the residual.
-  // 计算残差： 真值减去估计的值
+  // 计算残差： 真值减去估计的值（其实是一个重投影误差）
   r = z - Vector4d(p_c0(0)/p_c0(2), p_c0(1)/p_c0(2),
       p_c1(0)/p_c1(2), p_c1(1)/p_c1(2));
 
@@ -1081,9 +1138,10 @@ void MsckfVio::featureJacobian(
   int jacobian_row_size = 0;
   jacobian_row_size = 4 * valid_cam_state_ids.size();
 
+  //M是相机状态数
   // H_xj: 量测方程对系统状态的雅克比矩阵： 4M*(21+N*6)
   // H_fj: 量测方程对特征点的雅克比矩阵： 4M*3
-  // H_xj: 量测残差： 4M*1
+  // r_xj: 量测残差： 4M*1
   MatrixXd H_xj = MatrixXd::Zero(jacobian_row_size,
       21+state_server.cam_states.size()*6);
   MatrixXd H_fj = MatrixXd::Zero(jacobian_row_size, 3);
@@ -1101,6 +1159,7 @@ void MsckfVio::featureJacobian(
     // 计算某个特征对应的单个相机位姿的雅克比和残差
     measurementJacobian(cam_id, feature.id, H_xi, H_fi, r_i);
 
+    //统计相机的位姿数量
     auto cam_state_iter = state_server.cam_states.find(cam_id);
     int cam_state_cntr = std::distance(
         state_server.cam_states.begin(), cam_state_iter);
@@ -1128,7 +1187,8 @@ void MsckfVio::featureJacobian(
 }
 
 /**
- * @brief 计算某个特征点对应所有的相机测量的雅克比，并消除Hf
+ * @brief 将叠放在一起之后的雅克比矩阵分解，计算卡尔曼增益和下一时刻的的协方差矩阵。
+ * 更新所有的IMU状态，相机状态，协方差矩阵
  * @param  H_x  雅克比矩阵
  * @param  r   量测残差
  */
@@ -1147,6 +1207,7 @@ void MsckfVio::measurementUpdate(
   if (H.rows() > H.cols()) {
     // Convert H to a sparse matrix.
     // 定义雅克比矩阵的稀疏矩阵表示法
+    //把零块压缩
     SparseMatrix<double> H_sparse = H.sparseView();
 
     // Perform QR decompostion on H_sparse.
@@ -1165,9 +1226,11 @@ void MsckfVio::measurementUpdate(
     // 计算得到的
     MatrixXd H_temp;
     VectorXd r_temp;
+    //.evalTo():赋值给一个向量
+    //原论文里只对进行了QR分解
     (spqr_helper.matrixQ().transpose() * H).evalTo(H_temp);
     (spqr_helper.matrixQ().transpose() * r).evalTo(r_temp);
-
+    //取前row行
     H_thin = H_temp.topRows(21+state_server.cam_states.size()*6);
     r_thin = r_temp.head(21+state_server.cam_states.size()*6);
 
@@ -1179,6 +1242,7 @@ void MsckfVio::measurementUpdate(
     //r_thin = Q1.transpose() * r;
   } else {
     // 维度不高，不需要QR分解
+    //论文里的TH 《MSCKF》 EQUATION(29)
     H_thin = H;
     r_thin = r;
   }
@@ -1188,12 +1252,17 @@ void MsckfVio::measurementUpdate(
   // K = P * H_thin^T * (H_thin*P*H_thin^T + Rn)^-1
   // K * (H_thin*P*H_thin^T + Rn) = P * H_thin^T
   // -> (H_thin*P*H_thin^T + Rn)^T * K^T = H_thin * P^T
+  //这样一搞，把求逆就变没了
   const MatrixXd& P = state_server.state_cov;
   MatrixXd S = H_thin*P*H_thin.transpose() +
+  //把一个数乘以单位阵
       Feature::observation_noise*MatrixXd::Identity(
         H_thin.rows(), H_thin.rows());
+
+  //QR分解求解，三种方法：HouseholderQR、ColPivHouseholderQR、FullPivHouseholderQR
   //MatrixXd K_transpose = S.fullPivHouseholderQr().solve(H_thin*P);
   // P^T = P
+  //S.ldlt().solve（）：矩阵分解的一种方法，用来解线性方程组
   MatrixXd K_transpose = S.ldlt().solve(H_thin*P);
   MatrixXd K = K_transpose.transpose();
 
@@ -1211,6 +1280,7 @@ void MsckfVio::measurementUpdate(
   // 这两个子向量是imu的速度和位置，如果更新矫正的值过大则警告
   if (//delta_x_imu.segment<3>(0).norm() > 0.15 ||
       //delta_x_imu.segment<3>(3).norm() > 0.15 ||
+      //segment表示取后面起始位置的一个段
       delta_x_imu.segment<3>(6).norm() > 0.5 ||
       //delta_x_imu.segment<3>(9).norm() > 0.5 ||
       delta_x_imu.segment<3>(12).norm() > 1.0) {
@@ -1226,6 +1296,8 @@ void MsckfVio::measurementUpdate(
   // 更新imu速度：v = v + δv
   // 更新加速度偏置：b_a = b_a + δb_a
   // 更新imu位置：p = p + δp
+  
+  //取deltaIMU的前三个元素，然后将deltaQuaternion转为 fullQuaternion 
   const Vector4d dq_imu =
     smallAngleQuaternion(delta_x_imu.head<3>());
   state_server.imu_state.orientation = quaternionMultiplication(
@@ -1263,6 +1335,7 @@ void MsckfVio::measurementUpdate(
   state_server.state_cov = I_KH*state_server.state_cov;
 
   // Fix the covariance to be symmetric
+  //保证协方差是对称的
   MatrixXd state_cov_fixed = (state_server.state_cov +
       state_server.state_cov.transpose()) / 2.0;
   state_server.state_cov = state_cov_fixed;
@@ -1299,7 +1372,10 @@ bool MsckfVio::gatingTest(
 }
 
 /**
- * @brief 判断特征点是否为新的特征点并将其加入到地图点中
+ * @brief 测量更新，移除已经丢失的特征点
+ * 首先标记无效的特征点，将特征点移除后记录特征点。
+ * 计算特征点对于相机状态的雅克比矩阵。
+ * 卡方检验后执行测量更新。将叠放在一起之后的雅克比矩阵分解，然后计算卡尔曼增益，更新所有状态和所有协方差
  *  
  */
 void MsckfVio::removeLostFeatures() {
@@ -1316,6 +1392,8 @@ void MsckfVio::removeLostFeatures() {
     auto& feature = iter->second;
 
     // Pass the features that are still being tracked.
+    //如果找到此时正在观测的状态则略过，如果没有则返回end
+    //如果观测的特征少于三个则记为无效ID
     if (feature.observations.find(state_server.imu_state.id) !=
         feature.observations.end()) continue;
     if (feature.observations.size() < 3) {
@@ -1326,10 +1404,13 @@ void MsckfVio::removeLostFeatures() {
     // Check if the feature can be initialized if it
     // has not been.
     if (!feature.is_initialized) {
+      //如果运动向量和特征方向不正交，则记为无效
+      //这样做是检验运动有效性？
       if (!feature.checkMotion(state_server.cam_states)) {
         invalid_feature_ids.push_back(feature.id);
         continue;
       } else {
+
         if(!feature.initializePosition(state_server.cam_states)) {
           invalid_feature_ids.push_back(feature.id);
           continue;
@@ -1339,6 +1420,7 @@ void MsckfVio::removeLostFeatures() {
 
     // 雅克比矩阵的行数： 每个特征提供2
     // 保存要处理的特征
+    //observations的第二个元组为Vector4d
     jacobian_row_size += 4*feature.observations.size() - 3;
     processed_feature_ids.push_back(feature.id);
   }
@@ -1375,10 +1457,11 @@ void MsckfVio::removeLostFeatures() {
 
     MatrixXd H_xj;
     VectorXd r_j;
-    // 计算特征点单个相机位姿的雅克比和残差方程
+    // 计算特征点单个相机位姿的雅克比和残差方程，并映射到H_fj的左零空间
     featureJacobian(feature.id, cam_state_ids, H_xj, r_j);
 
     // gatingTest为卡方检验，检验通过将当前雅克比矩阵和残差压缩
+    //将H_xj竖着叠起来
     if (gatingTest(H_xj, r_j, cam_state_ids.size()-1)) {
       H_x.block(stack_cntr, 0, H_xj.rows(), H_xj.cols()) = H_xj;
       r.segment(stack_cntr, r_j.rows()) = r_j;
@@ -1387,7 +1470,7 @@ void MsckfVio::removeLostFeatures() {
 
     // Put an upper bound on the row size of measurement Jacobian,
     // which helps guarantee the executation time.
-    //
+    //设置一个测量雅克比压缩维数的上限，保证执行时间
     if (stack_cntr > 1500) break;
   }
 
@@ -1405,6 +1488,11 @@ void MsckfVio::removeLostFeatures() {
 
   return;
 }
+/*
+@brief 找到多余的相机状态
+从最新的状态之前的几个状态开始算起，计算是相对运动，然后如果相对运动满足
+一些条件则把相机状态删去，否则把第一个相机状态删去
+*/
 
 void MsckfVio::findRedundantCamStates(
     vector<StateIDType>& rm_cam_state_ids) {
@@ -1413,8 +1501,10 @@ void MsckfVio::findRedundantCamStates(
   auto key_cam_state_iter = state_server.cam_states.end();
   for (int i = 0; i < 4; ++i)
     --key_cam_state_iter;
+  //迭代器从后往前移动四个单位
   auto cam_state_iter = key_cam_state_iter;
   ++cam_state_iter;
+
   auto first_cam_state_iter = state_server.cam_states.begin();
 
   // Pose of the key camera state.
@@ -1431,15 +1521,18 @@ void MsckfVio::findRedundantCamStates(
     const Matrix3d rotation = quaternionToRotation(
         cam_state_iter->second.orientation);
 
+    //计算倒数第四个元素和倒数第三个元素之间的的欧式距离和角度
     double distance = (position-key_position).norm();
     double angle = AngleAxisd(
         rotation*key_rotation.transpose()).angle();
 
+    //如果角度和距离小于一定的阈值，则标记为移除
     //if (angle < 0.1745 && distance < 0.2 && tracking_rate > 0.5) {
     if (angle < 0.2618 && distance < 0.4 && tracking_rate > 0.5) {
       rm_cam_state_ids.push_back(cam_state_iter->first);
       ++cam_state_iter;
     } else {
+      //否则把第一个元素移除
       rm_cam_state_ids.push_back(first_cam_state_iter->first);
       ++first_cam_state_iter;
     }
@@ -1450,7 +1543,10 @@ void MsckfVio::findRedundantCamStates(
 
   return;
 }
+/*
+@brief 当相机状态达到窗口阈值时，将处理过的相机状态移出状态向量
 
+*/
 void MsckfVio::pruneCamStateBuffer() {
 
   if (state_server.cam_states.size() < max_cam_state_size)
@@ -1466,6 +1562,7 @@ void MsckfVio::pruneCamStateBuffer() {
     auto& feature = item.second;
     // Check how many camera states to be removed are associated
     // with this feature.
+    //去掉与特征点相关的相机状态
     vector<StateIDType> involved_cam_state_ids(0);
     for (const auto& cam_id : rm_cam_state_ids) {
       if (feature.observations.find(cam_id) !=
@@ -1496,7 +1593,7 @@ void MsckfVio::pruneCamStateBuffer() {
         }
       }
     }
-
+    //这个维数是怎么来的？
     jacobian_row_size += 4*involved_cam_state_ids.size() - 3;
   }
 
@@ -1523,6 +1620,7 @@ void MsckfVio::pruneCamStateBuffer() {
 
     MatrixXd H_xj;
     VectorXd r_j;
+    //计算某个特征点对所有相机的雅克比
     featureJacobian(feature.id, involved_cam_state_ids, H_xj, r_j);
 
     // 将当前所有的单个相机位姿进行压缩
@@ -1543,6 +1641,7 @@ void MsckfVio::pruneCamStateBuffer() {
   // Perform measurement update.
   measurementUpdate(H_x, r);
 
+  //将相机的状态从状态向量中移除 
   for (const auto& cam_id : rm_cam_state_ids) {
     int cam_sequence = std::distance(state_server.cam_states.begin(),
         state_server.cam_states.find(cam_id));
@@ -1551,6 +1650,7 @@ void MsckfVio::pruneCamStateBuffer() {
 
     // Remove the corresponding rows and columns in the state
     // covariance matrix.
+    //将协方差从对应的协方差矩阵中移除
     if (cam_state_end < state_server.state_cov.rows()) {
       state_server.state_cov.block(cam_state_start, 0,
           state_server.state_cov.rows()-cam_state_end,
@@ -1589,6 +1689,7 @@ void MsckfVio::onlineReset() {
 
   // Check the uncertainty of positions to determine if
   // the system can be reset.
+  //sqrt为什么还能算矩阵？
   double position_x_std = std::sqrt(state_server.state_cov(12, 12));
   double position_y_std = std::sqrt(state_server.state_cov(13, 13));
   double position_z_std = std::sqrt(state_server.state_cov(14, 14));

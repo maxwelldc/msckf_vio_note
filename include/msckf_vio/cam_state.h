@@ -40,6 +40,8 @@ struct CAMState {
   // There two variables are used to modify the measurement
   // Jacobian matrices to make the observability matrix
   // have proper null space.
+
+  //修改观测模型的雅克比，使其具有零空间
   Eigen::Vector4d orientation_null;
   Eigen::Vector3d position_null;
 

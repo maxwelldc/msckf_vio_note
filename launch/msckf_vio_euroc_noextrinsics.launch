@@ -35,10 +35,10 @@
       <param name="feature/config/translation_threshold" value="-1.0"/>
 
       <!-- These values should be standard deviation -->
-      <param name="noise/gyro" value="0.005"/>
-      <param name="noise/acc" value="0.05"/>
+      <param name="noise/gyro" value=" 0.1432"/>
+      <param name="noise/acc" value="0.0007"/>
       <param name="noise/gyro_bias" value="0.001"/>
-      <param name="noise/acc_bias" value="0.01"/>
+      <param name="noise/acc_bias" value="0.018"/>
       <param name="noise/feature" value="0.035"/>
 
       <param name="initial_state/velocity/x" value="0.0"/>
@@ -52,7 +52,7 @@
       <param name="initial_covariance/extrinsic_rotation_cov" value="2.742e-3"/>
       <param name="initial_covariance/extrinsic_translation_cov" value="4e-4"/>
 
-      <remap from="~imu" to="/imu0"/>
+      <remap from="~imu" to="/imu/data"/>
       <remap from="~features" to="image_processor/features"/>
 
     </node>

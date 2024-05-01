@@ -27,6 +27,8 @@ namespace msckf_vio {
  *    to the Appendix of "A Multi-State Constraint Kalman
  *    Filter for Vision-aided Inertial Navigation" for how
  *    the 3d position of a feature is initialized.
+ * 
+ *   这个文件是专门解决特征点的三角化的
  */
 struct Feature {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -290,6 +292,13 @@ bool Feature::checkMotion(
   else return false;
 }
 
+/**
+ * @brief 特征点的三角化
+ * 
+ * @param cam_states 
+ * @return true 
+ * @return false 
+ */
 bool Feature::initializePosition(
     const CamStateServer& cam_states) {
   // Organize camera poses and feature observations properly.

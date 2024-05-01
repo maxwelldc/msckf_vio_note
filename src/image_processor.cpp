@@ -18,11 +18,14 @@
 #include <msckf_vio/image_processor.h>
 #include <msckf_vio/utils.h>
 
+
 using namespace std;
 using namespace cv;
 using namespace Eigen;
 
 namespace msckf_vio {
+
+//构造函数
 ImageProcessor::ImageProcessor(ros::NodeHandle& n) :
   nh(n),
   is_first_img(true),
@@ -94,8 +97,24 @@ bool ImageProcessor::loadParameters() {
   cam1_distortion_coeffs[2] = cam1_distortion_coeffs_temp[2];
   cam1_distortion_coeffs[3] = cam1_distortion_coeffs_temp[3];
 
-  // getTransformCV的作用是讲kalibr标定结果的格式转换为opencv格式
+  // getTransformCV的作用是将kalibr标定结果的格式转换为opencv格式
   // 得到imu、cam0和cam1之间的外参数
+  
+  /********************************************************
+   * 方形的左上角的x-坐标
+   * 方形的左上角的y-坐标
+   * 宽
+   * 高
+   * 
+   * typedef struct CvRect 
+　　{ 
+　　int x; 
+　　int y; 
+　　int width;  
+　　int height;  
+　　}
+　　***********************************************************/
+  
   cv::Mat     T_imu_cam0 = utils::getTransformCV(nh, "cam0/T_cam_imu");
   cv::Matx33d R_imu_cam0(T_imu_cam0(cv::Rect(0,0,3,3)));
   cv::Vec3d   t_imu_cam0 = T_imu_cam0(cv::Rect(3,0,1,3));
@@ -110,6 +129,8 @@ bool ImageProcessor::loadParameters() {
   t_cam1_imu = -R_imu_cam1.t() * t_imu_cam1;
 
   // Processor parameters
+  //note:
+  // get param 4 is default value. When no param, parameter=4.
   nh.param<int>("grid_row", processor_config.grid_row, 4);
   nh.param<int>("grid_col", processor_config.grid_col, 4);
   nh.param<int>("grid_min_feature_num",
@@ -194,6 +215,8 @@ bool ImageProcessor::loadParameters() {
       ROS_INFO("Finish loading ROS parameters...");
 
       // Create feature detector.
+      //opencv3中的fast角点检测方法：  FastFeatureDetector
+      
       detector_ptr = FastFeatureDetector::create(
               processor_config.fast_threshold);
 
@@ -245,6 +268,7 @@ void ImageProcessor::stereoCallback(
       sensor_msgs::image_encodings::MONO8);
 
   // Build the image pyramids once since they're used at multiple places
+  //分别建立左右两个图像的金字塔模型，获取不同尺度的特征模型，在较快的运动情况下仍能获得有效的像素变化趋势。
   createImagePyramids();
 
   // Detect features in the first frame.
@@ -305,6 +329,7 @@ void ImageProcessor::stereoCallback(
   // 下一时刻的上一时刻相关信息即为当前时刻的信息
   cam0_prev_img_ptr = cam0_curr_img_ptr;
   prev_features_ptr = curr_features_ptr;
+  //为什么要交换呢？
   std::swap(prev_cam0_pyramid_, curr_cam0_pyramid_);
 
   // Initialize the current features to empty vectors.
@@ -360,6 +385,7 @@ void ImageProcessor::createImagePyramids() {
  * @brief 第一帧图像初始化
  * 提取fast关键点，用光流进行跟踪匹配关键点对（klt）
  * 对图像画格子，对格子内提取一定数量的特征点
+ * 并保存下来
  *
  */
 void ImageProcessor::initializeFirstFrame() {
@@ -370,6 +396,17 @@ void ImageProcessor::initializeFirstFrame() {
 
   // Detect new features on the frist image.
   // 提取FAST关键点
+  /***************************************
+   * keypoint支持基本的特征类型（orb,sift,等等）
+   * opencv的keypoint数据结构：
+   * KeyPoint() : pt(0,0), size(0), angle(-1), response(0), octave(0), class_id(-1) {}
+   * 
+   * pt(x,y):关键点的点坐标；
+   *size():该关键点邻域直径大小；
+   *angle:角度，表示关键点的方向，值为[零,三百六十)，负值表示不使用。
+   *response:响应强度，表示该点的角点程度 
+   * ***********************************/
+
   vector<KeyPoint> new_features(0);
   detector_ptr->detect(img, new_features);
 
@@ -398,10 +435,12 @@ void ImageProcessor::initializeFirstFrame() {
 
   // Group the features into grids
   // 图像画格子，将特征点分配到各个格子中
-  // GridFeatures为map<int,std::vector<FeatureMetaData>>
+  // typedef std::map<int, std::vector<FeatureMetaData> > GridFeatures;
   GridFeatures grid_new_features;
+  //把特征点信息塞进来
   for (int code = 0; code <
       processor_config.grid_row*processor_config.grid_col; ++code)
+      //map<int,pair<int,string>>[1]:往map里插入数据，但是这种插入方式和insert（）不同，这种会覆盖数据。
       grid_new_features[code] = vector<FeatureMetaData>(0);
 
   for (int i = 0; i < cam0_inliers.size(); ++i) {
@@ -412,6 +451,7 @@ void ImageProcessor::initializeFirstFrame() {
     // 按照特征点位置与格子大小的关系，分别分配到每个格子中
     int row = static_cast<int>(cam0_point.y / grid_height);
     int col = static_cast<int>(cam0_point.x / grid_width);
+    //从第一个格子往下数，是第几个格子
     int code = row*processor_config.grid_col + col;
 
     // 格子中的特征点信息保存
@@ -426,6 +466,7 @@ void ImageProcessor::initializeFirstFrame() {
   // 按照特征响应对格子中的所有特征点进行排序
   for (auto& item : grid_new_features)
     std::sort(item.second.begin(), item.second.end(),
+    //featureCompareByResponse是一个比较response的函数
         &ImageProcessor::featureCompareByResponse);
 
   // Collect new features within each grid with high response.
@@ -436,10 +477,11 @@ void ImageProcessor::initializeFirstFrame() {
     vector<FeatureMetaData>& features_this_grid = (*curr_features_ptr)[code];
     vector<FeatureMetaData>& new_features_this_grid = grid_new_features[code];
 
-    // 按照响应值从大到小取指定的特征点
+    // 把格子内的特征点保存下来
     for (int k = 0; k < processor_config.grid_min_feature_num &&
         k < new_features_this_grid.size(); ++k) {
       features_this_grid.push_back(new_features_this_grid[k]);
+      //.back()返回的是末尾元素
       features_this_grid.back().id = next_feature_id++;
       features_this_grid.back().lifetime = 1;
     }
@@ -483,7 +525,8 @@ void ImageProcessor::predictFeatureTracking(
   // TUDO:这里应该还有平移向量，预测一个值所以可以去掉？
   cv::Matx33f H = K * R_p_c * K.inv();
 
-  for (int i = 0; i < input_pts.size(); ++i) {
+  for (int i = 0; i < input_pts.size(); ++i) 
+  {
     cv::Vec3f p1(input_pts[i].x, input_pts[i].y, 1.0f);
     // 两个平面中的匹配点满足: x2 = H * x1
     // 归一化后的齐次坐标即另一个平面上匹配点的图像坐标
@@ -496,10 +539,11 @@ void ImageProcessor::predictFeatureTracking(
 }
 
 /**
- * @brief 第一帧图像初始化
- * 提取fast关键点，用光流进行跟踪匹配关键点对（klt）
- * 对图像画格子，对格子内提取一定数量的特征点
- *
+ * @brief 追踪特征点
+ * 1.左图的特征点前后帧跟踪，得到当前帧左图的特征点
+ * 2.当前帧左右图跟踪，得到当前帧右图特征点
+ * 3.左右图分别做RANSAC，剔除外点
+ * 4.更新格子内的特征点
  */
 void ImageProcessor::trackFeatures() {
   // Size of each grid.
@@ -512,8 +556,10 @@ void ImageProcessor::trackFeatures() {
   // Compute a rough relative rotation which takes a vector
   // from the previous frame to the current frame.
   // 根据imu的信息对前后时刻的图像的旋转计算得到一个初值
+  //前后帧跟踪以IMU积分作为先验
   Matx33f cam0_R_p_c;
   Matx33f cam1_R_p_c;
+  //得到两个相机前后帧图像之间的旋转
   integrateImuData(cam0_R_p_c, cam1_R_p_c);
 
   // Organize the features in the previous image.
@@ -562,6 +608,7 @@ void ImageProcessor::trackFeatures() {
 
   // Mark those tracked points out of the image region
   // as untracked.
+  //超出图像范围的点进行剔除
   for (int i = 0; i < curr_cam0_points.size(); ++i) {
     if (track_inliers[i] == 0) continue;
     if (curr_cam0_points[i].y < 0 ||
@@ -614,7 +661,7 @@ void ImageProcessor::trackFeatures() {
   // The stereo matching results are directly used in the RANSAC.
 
   // Step 1: stereo matching.
-  // 第一步： 对当前时刻的双目进行匹配
+  // 第一步： 对当前时刻的双目进行左右帧匹配
   vector<Point2f> curr_cam1_points(0);
   vector<unsigned char> match_inliers(0);
   stereoMatch(curr_tracked_cam0_points, curr_cam1_points, match_inliers);
@@ -660,6 +707,7 @@ void ImageProcessor::trackFeatures() {
   // Number of features after ransac.
   after_ransac = 0;
 
+  //更新格子内的特征点
   for (int i = 0; i < cam0_ransac_inliers.size(); ++i) {
     if (cam0_ransac_inliers[i] == 0 ||
         cam1_ransac_inliers[i] == 0) continue;
@@ -719,6 +767,8 @@ void ImageProcessor::stereoMatch(
   if (cam0_points.size() == 0) return;
 
   // 对第二帧图像中的特征点位置初始化
+
+  //有点问题？
   if(cam1_points.size() == 0) {
     // Initialize cam1_points by projecting cam0_points to cam1 using the
     // rotation from stereo extrinsics
@@ -730,6 +780,7 @@ void ImageProcessor::stereoMatch(
                     cam0_distortion_coeffs, cam0_points_undistorted,
                     R_cam0_cam1);
     // 第二个摄像头中的关键点位置
+    //得到的是投影的图像的位置
     cam1_points = distortPoints(cam0_points_undistorted, cam1_intrinsics,
                                 cam1_distortion_model, cam1_distortion_coeffs);
   }
@@ -787,6 +838,8 @@ void ImageProcessor::stereoMatch(
       cam1_points, cam1_intrinsics, cam1_distortion_model,
       cam1_distortion_coeffs, cam1_points_undistorted);
 
+
+  //为什么要取平均呢？
   // 将两个相机的fx和fy取平均: f_a = (fx_0+fy_0+fx_1+fy_1)/4.0
   // norm_pixel_unit = 1 / f_a
   double norm_pixel_unit = 4.0 / (
@@ -796,25 +849,33 @@ void ImageProcessor::stereoMatch(
   // 剔除明显不符合对极几何的点
   for (int i = 0; i < cam0_points_undistorted.size(); ++i) {
     if (inlier_markers[i] == 0) continue;
-    // 齐次坐标
+  
     cv::Vec3d pt0(cam0_points_undistorted[i].x,
         cam0_points_undistorted[i].y, 1.0);
     cv::Vec3d pt1(cam1_points_undistorted[i].x,
         cam1_points_undistorted[i].y, 1.0);
     // 根据本质矩阵得到极线
     // 极线计算公式：l' = F*x = (a,b,c)^t
+    //极线为什么这么算呢？
     cv::Vec3d epipolar_line = E * pt0;
     // 第二个相机中的匹配点到极线的距离(l' = ax+by+c)
     double error = fabs((pt1.t() * epipolar_line)[0]) / sqrt(
         epipolar_line[0]*epipolar_line[0]+
         epipolar_line[1]*epipolar_line[1]);
-    // 距离小于阈值就认为是外点，剔除
+    // 距离大于阈值就认为是外点，剔除
     if (error > processor_config.stereo_threshold*norm_pixel_unit)
       inlier_markers[i] = 0;
   }
 
   return;
 }
+/***************************************************
+ * @brief 将已将检测的特征点滤掉，重新检测特征点
+ * 将新检测的特征点进行左右帧匹配
+ * 将特征点进行分格子，重新按response进行排序
+ * 特征点超出最大特征数截掉，小于，补充
+ * 
+ * ****************************************************/
 
 void ImageProcessor::addNewFeatures() {
   const Mat& curr_img = cam0_curr_img_ptr->image;
@@ -848,6 +909,9 @@ void ImageProcessor::addNewFeatures() {
 
   // Detect new features.
   vector<KeyPoint> new_features(0);
+ 
+  //@param mask Mask specifying where to look for keypoints (optional). It must be a 8-bit integer
+  //  matrix with non-zero values in the region of interest.
   detector_ptr->detect(curr_img, new_features, mask);
 
   // Collect the new detected features based on the grid.
@@ -862,6 +926,7 @@ void ImageProcessor::addNewFeatures() {
   }
 
   new_features.clear();
+  //把特征点按响应值进行排序，超出特征点数量的截掉。
   for (auto& item : new_feature_sieve) {
     if (item.size() > processor_config.grid_max_feature_num) {
       std::sort(item.begin(), item.end(),
@@ -896,6 +961,7 @@ void ImageProcessor::addNewFeatures() {
 
   int matched_new_features = cam0_inliers.size();
 
+  //匹配的点太少时，或者匹配率太低时，认为图像不同步
   if (matched_new_features < 5 &&
       static_cast<double>(matched_new_features)/
       static_cast<double>(detected_new_features) < 0.1)
@@ -939,6 +1005,7 @@ void ImageProcessor::addNewFeatures() {
     if (features_this_grid.size() >=
         processor_config.grid_min_feature_num) continue;
 
+    //如果特征点小于最小特征点数量，则加入特征点的数量到格子内特征的最小数量
     int vacancy_num = processor_config.grid_min_feature_num -
       features_this_grid.size();
     for (int k = 0;
@@ -956,6 +1023,10 @@ void ImageProcessor::addNewFeatures() {
 
   return;
 }
+/************************************************
+ * @brief 按生存期把超出最大特征数的部分截掉
+ * 
+ * ***********************************************/
 
 void ImageProcessor::pruneGridFeatures() {
   for (auto& item : *curr_features_ptr) {
@@ -1050,6 +1121,9 @@ vector<cv::Point2f> ImageProcessor::distortPoints(
     // 将图像坐标（u,v）转换为齐次坐标(u,v,1)
     cv::convertPointsToHomogeneous(pts_in, homogenous_pts);
     // ?
+
+    //原本是将2d点投影到3D点，然后冲投影到2d点，但是为什么外参矩阵是零矩阵？
+    //用法：cv::projectPoints(input_pt3d,cam_r,cam_t,camInstris,camDistort,result_pt2d);
     cv::projectPoints(homogenous_pts, cv::Vec3d::zeros(), cv::Vec3d::zeros(), K,
                       distortion_coeffs, pts_out);
   } else if (distortion_model == "equidistant") {
@@ -1075,7 +1149,11 @@ vector<cv::Point2f> ImageProcessor::distortPoints(
 void ImageProcessor::integrateImuData(
     Matx33f& cam0_R_p_c, Matx33f& cam1_R_p_c) {
   // Find the start and the end limit within the imu msg buffer.
-  // 找到上一时刻和当前时刻的imu对应的时间戳
+  // 找到上一时刻图像和当前时刻的imu对应的时间戳
+  /****************************************************************************
+   * imu[0]-----imu[n]-----image[0]-----image[1]-----imu[x]------------imu[end]
+   *                  0.01s                     0.005s
+   * **************************************************************************/
   auto begin_iter = imu_msg_buffer.begin();
   while (begin_iter != imu_msg_buffer.end()) {
     if ((begin_iter->header.stamp-
@@ -1095,6 +1173,7 @@ void ImageProcessor::integrateImuData(
   }
 
   // Compute the mean angular velocity in the IMU frame.
+  //把IMU视为匀速运动
   // 计算imu系下的平均角速度
   Vec3f mean_ang_vel(0.0, 0.0, 0.0);
   for (auto iter = begin_iter; iter < end_iter; ++iter)
@@ -1106,6 +1185,7 @@ void ImageProcessor::integrateImuData(
 
   // Transform the mean angular velocity from the IMU
   // frame to the cam0 and cam1 frames.
+  //算法开始标定了两个坐标系的外参，这样得到相机的角速度
   // 将平均角速度从imu系转换到图像坐标系
   // t()表示转置
   Vec3f cam0_mean_ang_vel = R_cam0_imu.t() * mean_ang_vel;
@@ -1113,6 +1193,7 @@ void ImageProcessor::integrateImuData(
 
   // Compute the relative rotation.
   // 通过imu来计算前后两个时刻两帧图像之间的旋转
+  //通过罗德里格斯公式把旋转向量转化为旋转矩阵
   double dtime = (cam0_curr_img_ptr->header.stamp-
       cam0_prev_img_ptr->header.stamp).toSec();
   Rodrigues(cam0_mean_ang_vel*dtime, cam0_R_p_c);
@@ -1578,6 +1659,9 @@ void ImageProcessor::drawFeaturesStereo() {
   if(debug_stereo_pub.getNumSubscribers() > 0) {
     // Colors for different features.
     // 不同特征点用不同颜色显示
+    //in Eigen:typedef Matrix<Scalar, Rows, Cols, Options, MaxRows, MaxCols> XprType;
+    //typedef typename XprType::Scalar Scalar;
+    //是一个scalar类型的
     Scalar tracked(0, 255, 0);
     Scalar new_feature(0, 255, 255);
 
@@ -1643,19 +1727,24 @@ void ImageProcessor::drawFeaturesStereo() {
 
     // Draw tracked features.
     // 画出跟踪的特征点
+    //pt0是相机0 pt1是相机1
     for (const auto &id : prev_ids) {
       if (prev_cam0_points.find(id) != prev_cam0_points.end() &&
           curr_cam0_points.find(id) != curr_cam0_points.end()) {
         cv::Point2f prev_pt0 = prev_cam0_points[id];
+        //应该是把两张图像并到一起了
         cv::Point2f prev_pt1 = prev_cam1_points[id] + Point2f(img_width, 0.0);
         cv::Point2f curr_pt0 = curr_cam0_points[id];
         cv::Point2f curr_pt1 = curr_cam1_points[id] + Point2f(img_width, 0.0);
 
+        //opencv的函数
+        //tracked是颜色
         circle(out_img, curr_pt0, 3, tracked, -1);
         circle(out_img, curr_pt1, 3, tracked, -1);
         line(out_img, prev_pt0, curr_pt0, tracked, 1);
         line(out_img, prev_pt1, curr_pt1, tracked, 1);
 
+        //map中删除某个节点
         prev_cam0_points.erase(id);
         prev_cam1_points.erase(id);
         curr_cam0_points.erase(id);
